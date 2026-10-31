@@ -5,6 +5,9 @@ on:
     branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: macos-latest      # Apple Silicon
@@ -63,3 +66,15 @@ jobs:
           name: Label-Cropper-mac
           path: Label-Cropper.dmg
           retention-days: 90
+
+      - name: Publish release
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="v1.0.${GITHUB_RUN_NUMBER}"
+          gh release create "$TAG" "Label-Cropper.dmg" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Label Cropper $TAG" \
+            --notes "Open the .dmg and drag Label Cropper into Applications." \
+            --latest
