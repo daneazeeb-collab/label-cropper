@@ -44,6 +44,22 @@ from pypdf.generic import NameObject, NumberObject, RectangleObject
 import logging
 logging.getLogger("pypdf").setLevel(logging.ERROR)
 
+# PDFium is not thread-safe, and the window's server answers requests on several threads at
+# once (previews, saves, print checks). Every use of PDFium goes through this one lock;
+# without it PDFium corrupts its own memory and the app crashes.
+PDFIUM_LOCK = threading.RLock()
+
+
+def _pdfium_serialized(fn):
+    import functools
+
+    @functools.wraps(fn)
+    def wrapper(*a, **k):
+        with PDFIUM_LOCK:
+            return fn(*a, **k)
+    return wrapper
+
+
 PT = 72.0
 STOCK_W, STOCK_H = 4 * PT, 6 * PT          # finished label, portrait
 DETECT_SCALE = 200 / PT                     # 200 dpi for finding ink
@@ -63,6 +79,7 @@ def _ink_bbox(arr):
     return xs.min(), ys.min(), xs.max(), ys.max()
 
 
+@_pdfium_serialized
 def ink_bounds(pdf_bytes, page_index=0):
     """Bounds of all ink on the whole MediaBox, in PDF user-space points (l, b, r, t)."""
     doc = pdfium.PdfDocument(pdf_bytes)
@@ -178,6 +195,7 @@ def _stream_fingerprints(pdf_bytes):
     return prints
 
 
+@_pdfium_serialized
 def _render_displayed(pdf_bytes, page_index, scale, window=None, rotation=None):
     doc = pdfium.PdfDocument(pdf_bytes)
     try:
@@ -666,6 +684,8 @@ def make_handler(app):
                     return self._send(200, buf.getvalue(), "image/png")
                 return self._send(404, {"error": "Not found"})
             except Exception as e:
+                import traceback
+                traceback.print_exc()
                 return self._send(400, {"error": str(e)})
 
         def do_POST(self):
@@ -718,6 +738,8 @@ def make_handler(app):
                     return self._send(200, {"ok": not p["problem"], "problem": p["problem"]})
                 return self._send(404, {"error": "Not found"})
             except Exception as e:
+                import traceback
+                traceback.print_exc()
                 return self._send(400, {"error": str(e)})
 
     return H
@@ -796,11 +818,51 @@ def selftest():
         print(("PASS " if c["ok"] else "FAIL ") + c["name"] + ": " + c["detail"])
     after = p.read_bytes()
     assert ok and after.startswith(before) and status_of(after) == "cropped", "self-test failed"
+    # the window's server works on several threads at once; PDFium must survive that
+    errors = []
+
+    def hammer():
+        try:
+            for _ in range(15):
+                pl = make_plan(before)
+                nb = apply_plan(before, pl)
+                verify(before, nb, pl)
+                _render_displayed(nb, 0, 2.0)
+        except Exception as e:
+            errors.append(repr(e))
+    workers = [threading.Thread(target=hammer) for _ in range(8)]
+    [w.start() for w in workers]
+    [w.join() for w in workers]
+    assert not errors, f"parallel use failed: {errors[:2]}"
+    print("PASS Parallel use: 8 threads x 15 crop/verify/render rounds with no errors")
     assert (HERE / "app.html").is_file(), "app.html missing from bundle"
     print("SELFTEST OK")
 
 
+def _setup_logging():
+    """Keep a log and a crash trace in ~/Library/Logs/Label Cropper (the app window has no console)."""
+    import faulthandler
+    import traceback
+    logdir = Path.home() / "Library" / "Logs" / "Label Cropper"
+    try:
+        logdir.mkdir(parents=True, exist_ok=True)
+        log = open(logdir / "label-cropper.log", "a", buffering=1, encoding="utf-8")
+    except Exception:
+        return
+    if sys.stderr is None or getattr(sys, "frozen", False):
+        sys.stderr = log
+    if sys.stdout is None or getattr(sys, "frozen", False):
+        sys.stdout = log
+    faulthandler.enable(file=log, all_threads=True)
+    log.write(f"\n--- started {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
+
+    def hook(args):
+        log.write("".join(traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback)))
+    threading.excepthook = hook
+
+
 if __name__ == "__main__":
+    _setup_logging()
     port = int(os.environ.get("LABEL_PORT", 8737))
     if "--selftest" in sys.argv:
         selftest()
