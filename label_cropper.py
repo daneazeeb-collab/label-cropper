@@ -330,6 +330,171 @@ def choose_files():
 # ----------------------------------------------------------------------------
 # printing
 # ----------------------------------------------------------------------------
+# Talks to the Mac's print system (CUPS) over IPP, the same protocol System Settings uses,
+# so the app can see whether a printer is connected and whether a job really finished.
+import http.client
+import socket
+import struct
+
+CUPS_SOCKET = "/private/var/run/cupsd"
+
+
+class _UnixHTTP(http.client.HTTPConnection):
+    def __init__(self, path, timeout=5):
+        super().__init__("localhost", timeout=timeout)
+        self._path = path
+
+    def connect(self):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(self.timeout)
+        self.sock.connect(self._path)
+
+
+def _cups_connections():
+    host = os.environ.get("LABEL_CUPS_HOST")          # used for automated testing only
+    if host:
+        h, _, p = host.partition(":")
+        return [lambda: http.client.HTTPConnection(h, int(p or 631), timeout=5)]
+    out = []
+    if os.path.exists(CUPS_SOCKET):
+        out.append(lambda: _UnixHTTP(CUPS_SOCKET))
+    out.append(lambda: http.client.HTTPConnection("localhost", 631, timeout=5))
+    return out
+
+
+def _ipp_attr(tag, name, values):
+    out = b""
+    for i, v in enumerate(values):
+        if isinstance(v, int):
+            v = struct.pack(">i", v)
+        elif isinstance(v, str):
+            v = v.encode()
+        n = name.encode() if i == 0 else b""
+        out += struct.pack(">BH", tag, len(n)) + n + struct.pack(">H", len(v)) + v
+    return out
+
+
+def _ipp_parse(data):
+    status = struct.unpack(">H", data[2:4])[0]
+    i, groups, cur, last = 8, [], None, None
+    while i < len(data):
+        tag = data[i]; i += 1
+        if tag == 0x03:
+            break
+        if tag < 0x10:
+            cur = {}; groups.append((tag, cur)); last = None
+            continue
+        nl = struct.unpack(">H", data[i:i + 2])[0]; i += 2
+        name = data[i:i + nl].decode("utf-8", "replace"); i += nl
+        vl = struct.unpack(">H", data[i:i + 2])[0]; i += 2
+        raw = data[i:i + vl]; i += vl
+        if tag in (0x21, 0x23) and vl == 4:
+            val = struct.unpack(">i", raw)[0]
+        elif tag == 0x22:
+            val = raw != b"\x00"
+        else:
+            val = raw.decode("utf-8", "replace")
+        if name:
+            last = name
+            cur.setdefault(name, []).append(val)
+        elif last and cur is not None:
+            cur[last].append(val)
+    return status, groups
+
+
+def ipp(op, path, uri_name, uri, extra=b"", want=()):
+    body = struct.pack(">BBHI", 2, 0, op, 1) + b"\x01"
+    body += _ipp_attr(0x47, "attributes-charset", ["utf-8"])
+    body += _ipp_attr(0x48, "attributes-natural-language", ["en"])
+    body += _ipp_attr(0x45, uri_name, [uri])
+    body += _ipp_attr(0x42, "requesting-user-name", [os.environ.get("USER", "user")])
+    if want:
+        body += _ipp_attr(0x44, "requested-attributes", list(want))
+    body += extra + b"\x03"
+    err = None
+    for make in _cups_connections():
+        try:
+            c = make()
+            c.request("POST", path, body, {"Content-Type": "application/ipp"})
+            r = c.getresponse()
+            data = r.read()
+            c.close()
+            if r.status != 200:
+                raise RuntimeError(f"print system answered HTTP {r.status}")
+            status, groups = _ipp_parse(data)
+            merged = {}
+            for tag, g in groups:
+                if tag != 0x01:
+                    merged.update(g)
+            return status, merged
+        except Exception as e:
+            err = e
+    raise RuntimeError(f"Couldn't reach the Mac's print system ({err}).")
+
+
+PRINTER_STATES = {3: "idle", 4: "printing", 5: "stopped"}
+JOB_STATES = {3: "pending", 4: "held", 5: "printing", 6: "stopped", 7: "canceled", 8: "aborted", 9: "completed"}
+
+# printer-state-reasons -> what to tell you. Checked in this order; first match wins.
+REASONS = [
+    ("paused", "The printer is paused in macOS.", "resume"),
+    ("offline", "The printer isn't connected or is turned off.", None),
+    ("connecting-to-device", "The Mac can't find the printer. Check that it's plugged in and turned on.", None),
+    ("timed-out", "The printer stopped responding.", None),
+    ("shutdown", "The printer is turned off.", None),
+    ("media-empty", "The printer is out of labels.", None),
+    ("media-needed", "The printer needs labels loaded.", None),
+    ("media-jam", "Labels are jammed in the printer.", None),
+    ("cover-open", "The printer's cover is open.", None),
+    ("door-open", "The printer's door is open.", None),
+    ("marker-supply-empty", "The printer is out of ribbon or ink.", None),
+    ("cups-missing-filter", "macOS is missing the driver this printer needs.", None),
+    ("cups-insecure-filter", "macOS blocked this printer's driver.", None),
+]
+
+
+def _base_reason(r):
+    for suf in ("-error", "-warning", "-report"):
+        if r.endswith(suf):
+            return r[: -len(suf)], suf[1:]
+    return r, "error"
+
+
+def diagnose(state, accepting, reasons, message):
+    """Return (problem text or None, fix) for a printer's current condition."""
+    reasons = [r for r in reasons if r and r != "none"]
+    for key, text, fix in REASONS:
+        for r in reasons:
+            base, sev = _base_reason(r)
+            if base == key and (sev != "warning" or key in ("offline", "paused")):
+                return text + (f" ({message})" if message and message.lower() not in text.lower() else ""), fix
+    if state == "stopped":
+        return "The printer is stopped." + (f" ({message})" if message else ""), "resume"
+    if accepting is False:
+        return "The printer isn't accepting new jobs right now.", "resume"
+    for r in reasons:
+        base, sev = _base_reason(r)
+        if sev == "error":
+            return f"The printer reported a problem: {message or base.replace('-', ' ')}.", None
+    return None, None
+
+
+def printer_status(name):
+    status, a = ipp(0x000B, f"/printers/{name}", "printer-uri", f"ipp://localhost/printers/{name}",
+                    want=("printer-state", "printer-state-reasons", "printer-state-message",
+                          "printer-is-accepting-jobs", "printer-info", "device-uri"))
+    if status >= 0x0400:
+        raise RuntimeError("macOS doesn't know a printer by that name any more.")
+    state = PRINTER_STATES.get((a.get("printer-state") or [0])[0], "unknown")
+    accepting = (a.get("printer-is-accepting-jobs") or [True])[0]
+    reasons = a.get("printer-state-reasons") or []
+    message = ((a.get("printer-state-message") or [""])[0] or "").strip()
+    problem, fix = diagnose(state, accepting, reasons, message)
+    return {"name": name, "label": ((a.get("printer-info") or [""])[0] or name.replace("_", " ")),
+            "state": state, "accepting": accepting, "reasons": reasons, "message": message,
+            "problem": problem, "fix": fix}
+
+
 def printers():
     names, default = [], None
     try:
@@ -340,10 +505,31 @@ def printers():
         default = m.group(1) if m else None
     except Exception:
         pass
-    return {"printers": names, "default": default if default in names else (names[0] if names else None)}
+    items = []
+    for n in names:
+        try:
+            items.append(printer_status(n))
+        except Exception as e:
+            items.append({"name": n, "label": n.replace("_", " "), "problem": None, "unknown": str(e)})
+    return {"printers": items, "default": default if default in names else (names[0] if names else None)}
 
 
-def print_bytes(pdf_bytes, printer, title, oversize):
+def lpstat_status(name):
+    """Rougher check used only if the print system's status can't be read directly."""
+    try:
+        out = subprocess.run(["lpstat", "-p", name], capture_output=True, text=True, timeout=5)
+    except Exception:
+        return {"problem": None, "fix": None}
+    text = (out.stdout + out.stderr).lower()
+    if out.returncode != 0 or "invalid destination" in text or "does not exist" in text:
+        return {"problem": "macOS doesn't know a printer by that name any more.", "fix": None}
+    if "disabled" in text:
+        return {"problem": "The printer is paused in macOS.", "fix": "resume"}
+    return {"problem": None, "fix": None}
+
+
+def submit(pdf_bytes, printer, title, oversize):
+    """Hand the label to macOS. Returns the job's request id, e.g. 'Rollo-42'."""
     with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tf:
         tf.write(pdf_bytes)
         tmp = tf.name
@@ -352,11 +538,58 @@ def print_bytes(pdf_bytes, printer, title, oversize):
     cmd.append(tmp)
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        out = (r.stdout + r.stderr).strip()
         if r.returncode != 0:
-            raise RuntimeError((r.stderr or r.stdout).strip() or "The printer did not accept the job.")
-        return r.stdout.strip()
+            raise RuntimeError(out or "macOS refused the print job.")
+        m = re.search(r"request id is (\S+)", out)
+        if not m:
+            raise RuntimeError(f"macOS didn't confirm the print job. It said: {out or 'nothing'}")
+        return m.group(1)
     finally:
-        threading.Timer(120, lambda: os.path.exists(tmp) and os.remove(tmp)).start()
+        threading.Timer(300, lambda: os.path.exists(tmp) and os.remove(tmp)).start()
+
+
+def job_status(request_id, printer):
+    """Where a job is now: printing / done / failed / stuck, with a plain explanation."""
+    job_id = int(request_id.rsplit("-", 1)[-1])
+    status, a = ipp(0x0009, "/jobs", "job-uri", f"ipp://localhost/jobs/{job_id}",
+                    want=("job-state", "job-state-reasons", "job-printer-state-message",
+                          "job-state-message", "job-impressions-completed"))
+    if status >= 0x0400:
+        return {"phase": "failed", "text": "macOS lost track of this print job."}
+    js = JOB_STATES.get((a.get("job-state") or [0])[0], "unknown")
+    reasons = a.get("job-state-reasons") or []
+    msg = ((a.get("job-printer-state-message") or a.get("job-state-message") or [""])[0] or "").strip()
+    if js == "completed":
+        return {"phase": "done", "text": "The printer received the whole label."}
+    if js in ("canceled", "aborted"):
+        why = "It was canceled." if js == "canceled" else "macOS gave up on it."
+        return {"phase": "failed", "text": f"The label did not print. {why}" + (f" ({msg})" if msg else "")}
+    try:
+        p = printer_status(printer)
+    except Exception:
+        p = {"problem": None, "fix": None}
+    if js in ("stopped", "held") or p.get("problem"):
+        text = p.get("problem") or ("The job is on hold." if js == "held" else "The job stopped.")
+        return {"phase": "stuck", "text": text + " The label hasn't printed yet.", "fix": p.get("fix")}
+    return {"phase": "printing" if js == "printing" else "waiting", "text": msg or "Sending to the printer…"}
+
+
+def cancel_job(request_id):
+    r = subprocess.run(["cancel", request_id], capture_output=True, text=True, timeout=10)
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr or r.stdout).strip() or "macOS couldn't cancel the job.")
+
+
+def resume_printer(name):
+    errs = []
+    for cmd in (["cupsenable", name], ["cupsaccept", name]):
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        if r.returncode != 0:
+            errs.append((r.stderr or r.stdout).strip())
+    if errs:
+        raise RuntimeError("macOS didn't let the app resume the printer. Open System Settings → "
+                           "Printers & Scanners, pick the printer, and click Resume.")
 
 
 # ----------------------------------------------------------------------------
@@ -415,6 +648,8 @@ def make_handler(app):
                     return self._send(200, (HERE / "app.html").read_text(encoding="utf-8"), "text/html; charset=utf-8")
                 if u.path == "/api/printers":
                     return self._send(200, printers())
+                if u.path == "/api/job":
+                    return self._send(200, job_status(q["id"], q["printer"]))
                 if u.path == "/api/state":
                     path, data, plan = self._plan_from({**q, "crop": "0"})
                     rot, crop, media, pages = page_state(data)
@@ -466,8 +701,21 @@ def make_handler(app):
                         ok, checks = verify(data, new, plan)
                         if not ok:
                             return self._send(200, {"ok": False, "checks": checks})
-                    job = print_bytes(new, d["printer"], Path(path).stem, plan["oversize"])
+                    try:
+                        p = printer_status(d["printer"])
+                    except Exception:
+                        p = lpstat_status(d["printer"])        # fallback when status can't be read
+                    if p["problem"]:
+                        return self._send(200, {"ok": False, "problem": p["problem"], "fix": p["fix"]})
+                    job = submit(new, d["printer"], Path(path).stem, plan["oversize"])
                     return self._send(200, {"ok": True, "job": job})
+                if u.path == "/api/cancel":
+                    cancel_job(d["job"])
+                    return self._send(200, {"ok": True})
+                if u.path == "/api/resume":
+                    resume_printer(d["printer"])
+                    p = printer_status(d["printer"])
+                    return self._send(200, {"ok": not p["problem"], "problem": p["problem"]})
                 return self._send(404, {"error": "Not found"})
             except Exception as e:
                 return self._send(400, {"error": str(e)})

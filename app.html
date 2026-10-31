@@ -84,6 +84,14 @@ main { flex: 1; min-height: 0; display: flex; }
 .check.fail .mark { color: var(--bad); }
 .check .n { font-weight: 600; }
 .check .d { grid-column: 2; color: var(--muted); font-size: 12px; }
+.pstat { display: grid; gap: 10px; }
+.pstat .big { font-weight: 600; font-size: 14px; display: flex; gap: 8px; align-items: center; }
+.pstat .big.ok { color: var(--good); } .pstat .big.bad { color: var(--bad); } .pstat .big.wait { color: var(--muted); }
+.pstat p { margin: 0; color: var(--muted); }
+.pstat .acts { display: flex; flex-wrap: wrap; gap: 6px; }
+.spin { width: 12px; height: 12px; border: 2px solid var(--rule); border-top-color: var(--accent); border-radius: 50%; animation: sp .8s linear infinite; }
+@keyframes sp { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .spin { animation: none; } }
 
 
 .toast { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); background: var(--ink); color: var(--chrome); padding: 8px 14px; border-radius: 8px; font-weight: 500; z-index: 20; }
@@ -187,6 +195,7 @@ function refresh() {
   const t = cur();
   const has = !!t;
   ["rotate", "crop", "print", "save"].forEach(id => $(id).disabled = !has);
+  if (printing) $("print").disabled = true;
   $("empty").hidden = has; $("preview").hidden = !has; $("meta").textContent = "";
   if (!has) { $("state").innerHTML = ""; return; }
   $("crop").classList.toggle("on", t.crop);
@@ -231,18 +240,109 @@ $("save").onclick = async () => {
   } catch (e) { toast(`Couldn't save: ${e.message}`); }
   drawTabs(); refresh();
 };
-$("print").onclick = async () => {
-  const t = cur(); if (!t) return;
+// ---------- printing: check the printer, send, then follow the job until it's really done ----------
+let printing = null;            // {job, printer, name, started, timer}
+const PRINT_TIMEOUT = 60;       // seconds before we say it's taking too long
+
+function printPanel(kind, title, text, actions = []) {
+  $("reportTitle").textContent = "Print";
+  const box = $("checks"); box.textContent = "";
+  const w = document.createElement("div"); w.className = "pstat";
+  const big = document.createElement("div"); big.className = "big " + kind;
+  if (kind === "wait") { const s = document.createElement("span"); s.className = "spin"; big.append(s); }
+  else big.append(kind === "ok" ? "✓" : "✕");
+  big.append(" " + title);
+  const p = document.createElement("p"); p.textContent = text;
+  const acts = document.createElement("div"); acts.className = "acts";
+  for (const [label, fn, primary] of actions) {
+    const btn = document.createElement("button"); btn.className = "tool" + (primary ? " primary" : "");
+    btn.type = "button"; btn.textContent = label; btn.onclick = fn; acts.append(btn);
+  }
+  w.append(big, p); if (actions.length) w.append(acts);
+  box.append(w); $("report").hidden = false;
+}
+
+function endPrint() {
+  if (printing?.timer) clearTimeout(printing.timer);
+  printing = null; $("print").disabled = !cur(); $("print").textContent = ""; $("print").append(...printIcon());
+}
+const printIconHTML = $("print").innerHTML;
+function printIcon() { const t = document.createElement("template"); t.innerHTML = printIconHTML; return [...t.content.childNodes]; }
+
+async function startPrint() {
+  const t = cur(); if (!t || printing) return;
   const printer = $("printer").value;
-  if (!printer) { toast("Choose a printer first."); return; }
-  $("print").disabled = true;
+  if (!printer) { printPanel("bad", "Not printed", "Choose a printer first. If none are listed, add one in System Settings → Printers & Scanners.", [["Refresh printers", loadPrinters]]); return; }
+  const pname = $("printer").selectedOptions[0]?.dataset.label || printer;
+  $("print").disabled = true; $("print").textContent = "Checking…";
+  printPanel("wait", "Checking the printer…", `Making sure ${pname} is connected and ready.`);
+  let r;
+  try { r = await api("/api/print", { path: t.path, rotation: t.rotation, crop: t.crop, printer }); }
+  catch (e) { endPrint(); printPanel("bad", "Not printed", e.message, [["Try again", startPrint, true]]); return; }
+  if (!r.ok && r.checks) { endPrint(); showChecks("Not printed", r.checks); return; }
+  if (!r.ok) {
+    endPrint(); loadPrinters();
+    const acts = [["Try again", startPrint, true]];
+    if (r.fix === "resume") acts.unshift(["Resume printer", () => resume(printer), true]);
+    printPanel("bad", "Not printed", `${pname}: ${r.problem} Nothing was sent.`, acts);
+    return;
+  }
+  printing = { job: r.job, printer, pname, name: t.name, started: Date.now() };
+  $("print").textContent = "Printing…";
+  printPanel("wait", "Printing…", `Sending ${t.name} to ${pname}.`, [["Cancel", () => cancelJob(), false]]);
+  poll();
+}
+
+async function poll() {
+  const p = printing; if (!p) return;
+  let s;
+  try { s = await api(`/api/job?id=${encodeURIComponent(p.job)}&printer=${encodeURIComponent(p.printer)}`); }
+  catch (e) { s = { phase: "unknown", text: e.message }; }
+  if (printing !== p) return;
+  const secs = (Date.now() - p.started) / 1000;
+  if (s.phase === "done") {
+    endPrint(); printPanel("ok", "Printed", `${p.name} → ${p.pname}. ${s.text}`); toast(`Printed ${p.name}`); return;
+  }
+  if (s.phase === "failed") {
+    endPrint(); loadPrinters();
+    printPanel("bad", "Not printed", s.text, [["Try again", startPrint, true]]); return;
+  }
+  if (s.phase === "stuck") {
+    const acts = [["Cancel job", () => cancelJob(), false]];
+    if (s.fix === "resume") acts.unshift(["Resume printer", () => resume(p.printer, true), true]);
+    printPanel("bad", "Waiting on the printer", `${p.pname}: ${s.text} Fix the printer and it will print automatically, or cancel the job.`, acts);
+  } else if (s.phase === "unknown") {
+    p.misses = (p.misses || 0) + 1;
+    if (p.misses >= 3) {
+      endPrint();
+      printPanel("bad", "Sent, but not confirmed", `${p.name} was handed to ${p.pname}, but the app can't check whether it printed (${s.text}). Look at the printer before printing again.`);
+      return;
+    }
+  } else if (secs > PRINT_TIMEOUT) {
+    printPanel("bad", "Taking too long", `${p.pname} hasn't finished after ${Math.round(secs)} seconds. ${s.text}`, [["Keep waiting", () => { p.started = Date.now(); }, true], ["Cancel job", () => cancelJob(), false]]);
+  } else {
+    printPanel("wait", "Printing…", `${p.name} → ${p.pname}. ${s.text}`, [["Cancel", () => cancelJob(), false]]);
+  }
+  p.timer = setTimeout(poll, 1000);
+}
+
+async function cancelJob() {
+  const p = printing; if (!p) return;
+  try { await api("/api/cancel", { job: p.job }); endPrint(); printPanel("bad", "Canceled", `The print job for ${p.name} was canceled. Nothing more will print.`, [["Print again", startPrint, true]]); }
+  catch (e) { printPanel("bad", "Couldn't cancel", e.message, [["Try again", () => cancelJob(), true]]); }
+}
+
+async function resume(printer, keepPolling = false) {
   try {
-    const r = await api("/api/print", { path: t.path, rotation: t.rotation, crop: t.crop, printer });
-    if (r.ok) toast(`Sent ${t.name} to ${printer}`);
-    else { showChecks("Not printed", r.checks); toast("Not printed. A check failed."); }
-  } catch (e) { toast(`Couldn't print: ${e.message}`); }
-  $("print").disabled = false;
-};
+    const r = await api("/api/resume", { printer });
+    loadPrinters();
+    if (keepPolling) return;                       // the job resumes on its own; polling continues
+    if (r.ok) printPanel("ok", "Printer ready", "The printer is resumed. Click Print to send the label.", [["Print", startPrint, true]]);
+    else printPanel("bad", "Still not ready", r.problem, [["Try again", startPrint, true]]);
+  } catch (e) { printPanel("bad", "Couldn't resume", e.message); }
+}
+
+$("print").onclick = startPrint;
 function showChecks(title, checks) {
   $("reportTitle").textContent = title;
   const box = $("checks"); box.textContent = "";
@@ -258,16 +358,32 @@ $("closeReport").onclick = () => $("report").hidden = true;
 
 // ---------- printers ----------
 async function loadPrinters() {
-  const sel = $("printer");
+  const sel = $("printer"), keep = sel.value;
   try {
     const p = await api("/api/printers");
     sel.textContent = "";
     if (!p.printers.length) { sel.append(new Option("No printers found", "")); return; }
     let saved = null; try { saved = localStorage.getItem("lc-printer"); } catch {}
-    for (const n of p.printers) sel.append(new Option(n.replace(/_/g, " "), n));
-    sel.value = p.printers.includes(saved) ? saved : p.default;
+    for (const n of p.printers) {
+      const label = n.label || n.name;
+      const o = new Option(n.problem ? `${label} — ${shortProblem(n)}` : label, n.name);
+      o.dataset.label = label; sel.append(o);
+    }
+    const names = p.printers.map(n => n.name);
+    sel.value = names.includes(keep) ? keep : names.includes(saved) ? saved : p.default;
   } catch { sel.textContent = ""; sel.append(new Option("Printers unavailable", "")); }
 }
+function shortProblem(n) {
+  const r = (n.reasons || []).join(" ");
+  if (/paused/.test(r) || n.state === "stopped") return "paused";
+  if (/offline|connecting-to-device|timed-out|shutdown/.test(r)) return "not connected";
+  if (/media-empty|media-needed/.test(r)) return "out of labels";
+  if (/jam/.test(r)) return "jammed";
+  return "needs attention";
+}
+// keep printer status fresh without rebuilding the menu while it's open
+setInterval(() => { if (!printing && document.activeElement !== $("printer")) loadPrinters(); }, 10000);
+window.addEventListener("focus", () => { if (!printing) loadPrinters(); });
 $("printer").onchange = e => { try { localStorage.setItem("lc-printer", e.target.value); } catch {} };
 
 // ---------- open (Finder window) ----------
