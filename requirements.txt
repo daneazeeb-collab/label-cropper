@@ -1,0 +1,5 @@
+pypdf==6.17.0
+pypdfium2==5.13.0
+numpy
+pillow
+pywebview>=5.3

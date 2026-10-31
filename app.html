@@ -1,0 +1,311 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Label Cropper</title>
+<style>
+/* Layout: document tabs across the top, one slim toolbar, the label on a dark work surface. */
+:root {
+  --chrome: #ecedef;        /* window chrome */
+  --tab: #f8f8f9;           /* active tab and toolbar */
+  --surface: #2a2d31;       /* work area behind the label */
+  --ink: #1b1d20;
+  --muted: #6a7078;
+  --rule: #d3d6da;
+  --accent: #2463b0;
+  --accent-ink: #ffffff;
+  --pending: #c27a12;
+  --good: #23824a;
+  --bad: #b8322a;
+  --font: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", Arial, sans-serif;
+  --mono: "SF Mono", ui-monospace, Menlo, monospace;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --chrome: #1d1f22; --tab: #2b2e32; --surface: #141517; --ink: #e9ebee; --muted: #9aa0a8; --rule: #3a3e44;
+    --accent: #5a9cf0; --accent-ink: #0b1626; --pending: #e7a541; --good: #4cc27c; --bad: #f0716a;
+    color-scheme: dark;
+  }
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body { font: 13px/1.4 var(--font); color: var(--ink); background: var(--surface); display: flex; flex-direction: column; }
+button, select, input { font: inherit; color: inherit; }
+button:focus-visible, select:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+/* tabs */
+.tabs { display: flex; align-items: flex-end; background: var(--chrome); border-bottom: 1px solid var(--rule); padding: 6px 8px 0; gap: 2px; min-height: 40px; overflow-x: auto; }
+.tab { display: flex; align-items: center; gap: 8px; padding: 8px 10px 8px 12px; border-radius: 7px 7px 0 0; cursor: pointer; max-width: 240px; min-width: 120px; color: var(--muted); border: 1px solid transparent; border-bottom: 0; flex-shrink: 0; }
+.tab:hover { background: color-mix(in srgb, var(--tab) 60%, transparent); }
+.tab.on { background: var(--tab); color: var(--ink); border-color: var(--rule); margin-bottom: -1px; }
+.tab .dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; background: var(--rule); }
+.tab .dot.pending { background: var(--pending); }
+.tab .dot.good { background: var(--good); }
+.tab .label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+.tab .x { border: 0; background: none; width: 18px; height: 18px; border-radius: 4px; cursor: pointer; color: var(--muted); padding: 0; line-height: 18px; font-size: 15px; }
+.tab .x:hover { background: var(--rule); color: var(--ink); }
+.addtab { border: 0; background: none; font-size: 18px; width: 30px; height: 30px; border-radius: 6px; cursor: pointer; color: var(--muted); margin-bottom: 4px; flex-shrink: 0; }
+.addtab:hover { background: var(--tab); color: var(--ink); }
+
+/* toolbar */
+.bar { display: flex; align-items: center; gap: 6px; padding: 8px 12px; background: var(--tab); border-bottom: 1px solid var(--rule); flex-wrap: wrap; }
+.tool { display: inline-flex; align-items: center; gap: 6px; padding: 6px 12px; border-radius: 6px; border: 1px solid var(--rule); background: transparent; cursor: pointer; font-weight: 500; }
+.tool:hover:not(:disabled) { border-color: var(--accent); }
+.tool.on { background: color-mix(in srgb, var(--accent) 16%, transparent); border-color: var(--accent); color: var(--accent); }
+.tool.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+.tool:disabled { opacity: .4; cursor: default; }
+.tool svg { width: 15px; height: 15px; }
+.sep { width: 1px; height: 22px; background: var(--rule); margin: 0 6px; }
+select { padding: 5px 8px; border-radius: 6px; border: 1px solid var(--rule); background: var(--tab); max-width: 220px; }
+.state { margin-left: auto; color: var(--muted); font-variant-numeric: tabular-nums; }
+.state b { font-weight: 600; }
+.state .pending { color: var(--pending); }
+.state .good { color: var(--good); }
+.state .bad { color: var(--bad); }
+
+/* work area */
+main { flex: 1; min-height: 0; display: flex; }
+.stage { flex: 1; min-width: 0; display: grid; place-items: center; padding: 24px; overflow: auto; position: relative; }
+.stage img { max-width: 100%; max-height: calc(100vh - 150px); background: #fff; box-shadow: 0 2px 6px rgba(0,0,0,.35), 0 12px 32px rgba(0,0,0,.3); transition: opacity .12s; }
+.stage img.loading { opacity: .45; }
+.meta { position: absolute; bottom: 10px; left: 0; right: 0; text-align: center; color: #9aa0a8; font: 12px var(--mono); }
+.empty { color: #9aa0a8; text-align: center; max-width: 380px; line-height: 1.6; }
+.empty b { color: #e9ebee; display: block; font-size: 15px; margin-bottom: 4px; }
+
+.report { width: 300px; flex-shrink: 0; background: var(--tab); border-left: 1px solid var(--rule); padding: 16px; overflow-y: auto; }
+.report[hidden] { display: none; }
+.report h2 { font-size: 13px; margin: 0 0 12px; display: flex; justify-content: space-between; align-items: center; }
+.report h2 button { border: 0; background: none; cursor: pointer; color: var(--muted); font-size: 15px; }
+.check { display: grid; grid-template-columns: 18px 1fr; gap: 2px 8px; margin-bottom: 12px; }
+.check .mark { font-weight: 700; }
+.check.ok .mark { color: var(--good); }
+.check.fail .mark { color: var(--bad); }
+.check .n { font-weight: 600; }
+.check .d { grid-column: 2; color: var(--muted); font-size: 12px; }
+
+
+.toast { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); background: var(--ink); color: var(--chrome); padding: 8px 14px; border-radius: 8px; font-weight: 500; z-index: 20; }
+.toast[hidden] { display: none; }
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+@media (max-width: 760px) { .report { position: fixed; right: 0; top: 0; bottom: 0; z-index: 9; } }
+</style>
+</head>
+<body>
+<nav class="tabs" id="tabs" aria-label="Open labels"></nav>
+
+<div class="bar">
+  <button class="tool" id="open" title="Open labels (⌘O)">
+    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M1.5 4.5v9h13v-7H8L6.5 4.5z"/><path d="M1.5 4.5V2.5h5L8 4"/></svg>Open</button>
+  <span class="sep"></span>
+  <button class="tool" id="rotate" title="Rotate a quarter turn (R)" disabled>
+    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M13 8a5 5 0 1 1-1.6-3.7"/><path d="M13 2.5v3h-3"/></svg>Rotate</button>
+  <button class="tool" id="crop" title="Find the label and crop to 4 × 6 (C)" disabled>
+    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M4 1v11h11"/><path d="M1 4h11v11"/></svg>Crop to 4×6</button>
+  <span class="sep"></span>
+  <select id="printer" aria-label="Printer"><option>Loading printers…</option></select>
+  <button class="tool" id="print" title="Print (⌘P)" disabled>
+    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M4 6V1.5h8V6"/><rect x="1.5" y="6" width="13" height="6" rx="1"/><path d="M4 10h8v4.5H4z"/></svg>Print</button>
+  <button class="tool primary" id="save" title="Save over the original file (⌘S)" disabled>Save</button>
+  <span class="state" id="state"></span>
+</div>
+
+<main>
+  <section class="stage" id="stage">
+    <div class="empty" id="empty"><b>No labels open</b>Click Open, then select one or more labels in the Finder window.</div>
+    <img id="preview" alt="Label preview" hidden>
+    <div class="meta" id="meta"></div>
+  </section>
+  <aside class="report" id="report" hidden>
+    <h2><span id="reportTitle">Save checks</span><button id="closeReport" aria-label="Close checks">×</button></h2>
+    <div id="checks"></div>
+  </aside>
+</main>
+
+<div class="toast" id="toast" role="status" hidden></div>
+
+<script>
+const $ = id => document.getElementById(id);
+const tabs = [];                  // {path, name, fileRot, rotation, crop, status, saved, autoRotation, oversize}
+let active = -1, previewSeq = 0;
+
+const api = async (url, body) => {
+  const r = await fetch(url, body ? { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) } : {});
+  const j = await r.json();
+  if (!r.ok) throw new Error(j.error || "Something went wrong");
+  return j;
+};
+const toast = (msg) => { const t = $("toast"); t.textContent = msg; t.hidden = false; clearTimeout(toast.t); toast.t = setTimeout(() => t.hidden = true, 2600); };
+const cur = () => tabs[active];
+const dirty = t => t.crop || t.rotation !== t.fileRot;
+
+// ---------- tabs ----------
+function drawTabs() {
+  const nav = $("tabs"); nav.textContent = "";
+  tabs.forEach((t, i) => {
+    const el = document.createElement("div");
+    el.className = "tab" + (i === active ? " on" : "");
+    el.setAttribute("role", "tab"); el.setAttribute("aria-selected", i === active); el.tabIndex = 0;
+    el.title = t.path;
+    const dot = document.createElement("span");
+    dot.className = "dot " + (dirty(t) || t.status === "needs crop" ? "pending" : t.status === "cropped" ? "good" : "");
+    const lb = document.createElement("span"); lb.className = "label"; lb.textContent = t.name;
+    const x = document.createElement("button"); x.className = "x"; x.textContent = "×"; x.setAttribute("aria-label", "Close " + t.name);
+    x.onclick = e => { e.stopPropagation(); closeTab(i); };
+    el.onclick = () => select(i);
+    el.onkeydown = e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); select(i); } };
+    el.append(dot, lb, x); nav.append(el);
+  });
+  const add = document.createElement("button"); add.className = "addtab"; add.textContent = "+"; add.title = "Open a label";
+  add.setAttribute("aria-label", "Open labels"); add.onclick = openFiles;
+  nav.append(add);
+}
+
+async function openLabel(item, focus = true) {
+  const at = tabs.findIndex(t => t.path === item.path);
+  if (at >= 0) { if (focus) select(at); return; }
+  try {
+    const s = await api("/api/state?path=" + encodeURIComponent(item.path));
+    tabs.push({ path: item.path, name: item.name, fileRot: s.rotation, rotation: s.rotation, crop: false,
+                status: s.status, autoRotation: s.autoRotation, oversize: s.oversize, pages: s.pages });
+    if (focus || active < 0) select(tabs.length - 1); else drawTabs();
+  } catch (e) { toast(`Couldn't open ${item.name}: ${e.message}`); }
+}
+function closeTab(i) {
+  tabs.splice(i, 1);
+  if (active >= tabs.length) active = tabs.length - 1;
+  else if (i < active) active--;
+  select(active);
+}
+function select(i) {
+  active = i; drawTabs(); $("report").hidden = true; refresh();
+}
+
+// ---------- view ----------
+function refresh() {
+  const t = cur();
+  const has = !!t;
+  ["rotate", "crop", "print", "save"].forEach(id => $(id).disabled = !has);
+  $("empty").hidden = has; $("preview").hidden = !has; $("meta").textContent = "";
+  if (!has) { $("state").innerHTML = ""; return; }
+  $("crop").classList.toggle("on", t.crop);
+  $("save").disabled = !dirty(t);
+  const st = $("state");
+  if (dirty(t)) st.innerHTML = `<b class="pending">Not saved</b> · ${t.crop ? "cropped to 4 × 6" : "rotated"}`;
+  else if (t.status === "cropped") st.innerHTML = `<b class="good">Saved</b> · 4 × 6 label`;
+  else st.innerHTML = `<b class="pending">Original</b> · click Crop to 4×6`;
+  const seq = ++previewSeq, img = $("preview");
+  img.classList.add("loading");
+  const q = new URLSearchParams({ path: t.path, rotation: t.rotation, crop: t.crop ? 1 : 0, v: Date.now() });
+  const next = new Image();
+  next.onload = () => {
+    if (seq !== previewSeq) return;
+    img.src = next.src; img.classList.remove("loading");
+    const w = next.naturalWidth / 144, h = next.naturalHeight / 144;
+    $("meta").textContent = `${w.toFixed(1)} × ${h.toFixed(1)} in${t.pages > 1 ? ` · page 1 of ${t.pages}` : ""}${t.crop && t.oversize ? " · larger than 4 × 6, will print scaled to fit" : ""}`;
+  };
+  next.onerror = () => { if (seq === previewSeq) { img.classList.remove("loading"); toast("Couldn't draw this label."); } };
+  next.src = "/api/preview?" + q;
+}
+
+// ---------- actions ----------
+$("rotate").onclick = () => { const t = cur(); if (!t) return; t.rotation = (t.rotation + 90) % 360; drawTabs(); refresh(); };
+$("crop").onclick = () => {
+  const t = cur(); if (!t) return;
+  t.crop = !t.crop;
+  t.rotation = t.crop ? t.autoRotation : t.fileRot;
+  drawTabs(); refresh();
+};
+$("save").onclick = async () => {
+  const t = cur(); if (!t || !dirty(t)) return;
+  $("save").disabled = true; $("state").innerHTML = "Checking and saving…";
+  try {
+    const r = await api("/api/save", { path: t.path, rotation: t.rotation, crop: t.crop });
+    showChecks(r.ok ? "Saved · all checks passed" : "Not saved", r.checks);
+    if (r.ok) {
+      const s = await api("/api/state?path=" + encodeURIComponent(t.path));
+      Object.assign(t, { fileRot: s.rotation, rotation: s.rotation, crop: false, status: s.status, autoRotation: s.autoRotation });
+      toast(`Saved ${t.name}`);
+    } else toast("Not saved. A check failed, so the file was left as it was.");
+  } catch (e) { toast(`Couldn't save: ${e.message}`); }
+  drawTabs(); refresh();
+};
+$("print").onclick = async () => {
+  const t = cur(); if (!t) return;
+  const printer = $("printer").value;
+  if (!printer) { toast("Choose a printer first."); return; }
+  $("print").disabled = true;
+  try {
+    const r = await api("/api/print", { path: t.path, rotation: t.rotation, crop: t.crop, printer });
+    if (r.ok) toast(`Sent ${t.name} to ${printer}`);
+    else { showChecks("Not printed", r.checks); toast("Not printed. A check failed."); }
+  } catch (e) { toast(`Couldn't print: ${e.message}`); }
+  $("print").disabled = false;
+};
+function showChecks(title, checks) {
+  $("reportTitle").textContent = title;
+  const box = $("checks"); box.textContent = "";
+  for (const c of checks) {
+    const d = document.createElement("div"); d.className = "check " + (c.ok ? "ok" : "fail");
+    d.innerHTML = `<span class="mark">${c.ok ? "✓" : "✕"}</span><span class="n"></span><span class="d"></span>`;
+    d.querySelector(".n").textContent = c.name; d.querySelector(".d").textContent = c.detail;
+    box.append(d);
+  }
+  $("report").hidden = false;
+}
+$("closeReport").onclick = () => $("report").hidden = true;
+
+// ---------- printers ----------
+async function loadPrinters() {
+  const sel = $("printer");
+  try {
+    const p = await api("/api/printers");
+    sel.textContent = "";
+    if (!p.printers.length) { sel.append(new Option("No printers found", "")); return; }
+    let saved = null; try { saved = localStorage.getItem("lc-printer"); } catch {}
+    for (const n of p.printers) sel.append(new Option(n.replace(/_/g, " "), n));
+    sel.value = p.printers.includes(saved) ? saved : p.default;
+  } catch { sel.textContent = ""; sel.append(new Option("Printers unavailable", "")); }
+}
+$("printer").onchange = e => { try { localStorage.setItem("lc-printer", e.target.value); } catch {} };
+
+// ---------- open (Finder window) ----------
+async function openFiles() {
+  const btn = $("open");
+  if (btn.disabled) return;
+  btn.disabled = true; toast("Choose labels in the Finder window…");
+  try {
+    const r = await api("/api/open", {});
+    $("toast").hidden = true;
+    if (r.busy) { toast("A Finder window is already open."); return; }
+    const first = tabs.length;
+    for (const f of r.files) await openLabel(f, false);
+    if (r.files.length) {
+      const at = tabs.findIndex(t => t.path === r.files[0].path);
+      select(at >= 0 ? at : first);
+    }
+  } catch (e) { toast(`Couldn't open files: ${e.message}`); }
+  finally { btn.disabled = false; }
+}
+$("open").onclick = openFiles;
+
+// ---------- keys ----------
+document.addEventListener("keydown", e => {
+  const mod = e.metaKey || e.ctrlKey;
+  if (mod && e.key.toLowerCase() === "o") { e.preventDefault(); openFiles(); }
+  else if (mod && e.key.toLowerCase() === "s") { e.preventDefault(); $("save").click(); }
+  else if (mod && e.key.toLowerCase() === "p") { e.preventDefault(); $("print").click(); }
+  else if (mod && e.key.toLowerCase() === "w" && cur()) { e.preventDefault(); closeTab(active); }
+  else if (!mod && e.target.tagName !== "INPUT" && e.target.tagName !== "SELECT") {
+    if (e.key === "r" || e.key === "R") $("rotate").click();
+    if (e.key === "c" || e.key === "C") $("crop").click();
+  }
+});
+window.addEventListener("beforeunload", e => { if (tabs.some(dirty)) { e.preventDefault(); e.returnValue = ""; } });
+
+// ---------- start ----------
+drawTabs(); refresh(); loadPrinters();
+</script>
+</body>
+</html>
