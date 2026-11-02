@@ -713,8 +713,20 @@ def resume_printer(name):
 HERE = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
 
 
+def _quit_app():
+    """Close the window and end the process (used to let an update swap the app)."""
+    try:
+        if WINDOW is not None:
+            WINDOW.destroy()
+    finally:
+        threading.Timer(1.5, lambda: os._exit(0)).start()
+
+
 class App:
     def __init__(self):
+        import updater
+        self.updater = updater.Updater()
+        self.update_info = None
         self.opened = set()           # only files you picked in the Finder window can be read or saved
         self.choosing = threading.Lock()
 
@@ -763,6 +775,12 @@ def make_handler(app):
                     return self._send(200, (HERE / "app.html").read_text(encoding="utf-8"), "text/html; charset=utf-8")
                 if u.path == "/api/printers":
                     return self._send(200, printers())
+                if u.path == "/api/update/check":
+                    import updater
+                    app.update_info = updater.check()
+                    return self._send(200, app.update_info)
+                if u.path == "/api/update/status":
+                    return self._send(200, app.updater.status())
                 if u.path == "/api/job":
                     return self._send(200, job_status(q["id"], q["printer"]))
                 if u.path == "/api/state":
@@ -843,6 +861,14 @@ def make_handler(app):
                             f"labels.{hint}"})
                     job = submit(copy, d["printer"], Path(path).stem, plan["oversize"], media)
                     return self._send(200, {"ok": True, "job": job})
+                if u.path == "/api/update/start":
+                    if not app.update_info or not app.update_info.get("available"):
+                        raise ValueError("Check for updates first.")
+                    app.updater.start(app.update_info)
+                    return self._send(200, app.updater.status())
+                if u.path == "/api/update/install":
+                    app.updater.install_and_quit(_quit_app)
+                    return self._send(200, {"ok": True})
                 if u.path == "/api/cancel":
                     cancel_job(d["job"])
                     return self._send(200, {"ok": True})
@@ -987,6 +1013,10 @@ if __name__ == "__main__":
     port = int(os.environ.get("LABEL_PORT", 8737))
     if "--selftest" in sys.argv:
         selftest()
+    elif "--update-selftest" in sys.argv:
+        import updater
+        i = sys.argv.index("--update-selftest")
+        updater.selftest(sys.argv[i + 1], sys.argv[i + 2])
     elif "--browser" in sys.argv or os.environ.get("LABEL_BROWSER") == "1":
         run_browser(port)
     else:

@@ -23,6 +23,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
 
       - uses: actions/setup-python@v5
         with:
@@ -43,6 +45,7 @@ jobs:
             --icon assets/icon.icns \
             --osx-bundle-identifier com.danezeeb.labelcropper \
             --add-data "app.html:." \
+            --hidden-import updater \
             --collect-all pypdfium2 --collect-all pypdfium2_raw \
             label_cropper.py
           APP="dist/Label Cropper.app"
@@ -69,11 +72,18 @@ jobs:
           hdiutil create -volname "Label Cropper" -srcfolder dmg -ov -format UDZO "Label-Cropper-${{ matrix.arch }}.dmg"
           hdiutil verify "Label-Cropper-${{ matrix.arch }}.dmg"
           ls -lh "Label-Cropper-${{ matrix.arch }}.dmg"
+          shasum -a 256 "Label-Cropper-${{ matrix.arch }}.dmg" > "Label-Cropper-${{ matrix.arch }}.dmg.sha256"
+          cat "Label-Cropper-${{ matrix.arch }}.dmg.sha256"
+
+      - name: Test a real in-app update
+        run: python label_cropper.py --update-selftest "Label-Cropper-${{ matrix.arch }}.dmg" "1.0.${GITHUB_RUN_NUMBER}"
 
       - uses: actions/upload-artifact@v4
         with:
           name: Label-Cropper-${{ matrix.arch }}
-          path: Label-Cropper-${{ matrix.arch }}.dmg
+          path: |
+            Label-Cropper-${{ matrix.arch }}.dmg
+            Label-Cropper-${{ matrix.arch }}.dmg.sha256
           retention-days: 90
 
       - name: Publish release
@@ -83,8 +93,8 @@ jobs:
         run: |
           TAG="v1.0.${GITHUB_RUN_NUMBER}"
           FILE="Label-Cropper-${{ matrix.arch }}.dmg"
-          # whichever machine finishes first creates the release; the other adds its file
+          git log -1 --pretty='%s%n%n%b' | grep -v -E '^(Co-Authored-By|Claude-Session):' > notes.txt
+          # whichever machine finishes first creates the release; the other adds its files
           gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "Label Cropper $TAG" \
-            --notes "Open the .dmg for your Mac (AppleSilicon or Intel) and drag Label Cropper into Applications." \
-            --latest 2>/dev/null || true
-          gh release upload "$TAG" "$FILE" --repo "$GITHUB_REPOSITORY" --clobber
+            --notes-file notes.txt --latest 2>/dev/null || true
+          gh release upload "$TAG" "$FILE" "$FILE.sha256" --repo "$GITHUB_REPOSITORY" --clobber

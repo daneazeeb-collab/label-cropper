@@ -36,7 +36,20 @@ button, select, input { font: inherit; color: inherit; }
 button:focus-visible, select:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 
 /* tabs */
-.tabs { display: flex; align-items: flex-end; background: var(--chrome); border-bottom: 1px solid var(--rule); padding: 6px 8px 0; gap: 2px; min-height: 40px; overflow-x: auto; }
+.topline { display: flex; align-items: flex-end; background: var(--chrome); border-bottom: 1px solid var(--rule); }
+.tabs { display: flex; align-items: flex-end; padding: 6px 8px 0; gap: 2px; min-height: 40px; overflow-x: auto; flex: 1; min-width: 0; }
+.ver { flex-shrink: 0; align-self: center; margin: 0 10px; border: 1px solid transparent; background: none; color: var(--muted); font: 12px var(--font); padding: 4px 8px; border-radius: 6px; cursor: pointer; font-variant-numeric: tabular-nums; }
+.ver:hover { border-color: var(--rule); color: var(--ink); }
+.ver.has { color: var(--accent); border-color: var(--accent); font-weight: 600; }
+.upd { display: flex; align-items: center; gap: 10px; padding: 8px 14px; background: color-mix(in srgb, var(--accent) 12%, var(--tab)); border-bottom: 1px solid var(--rule); flex-wrap: wrap; }
+.upd[hidden] { display: none; }
+.upd.bad { background: color-mix(in srgb, var(--bad) 12%, var(--tab)); }
+.upd-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); flex-shrink: 0; }
+.upd.bad .upd-dot { background: var(--bad); }
+.upd-text { flex: 1; min-width: 200px; }
+.upd-bar { width: 160px; height: 6px; border-radius: 3px; background: var(--rule); overflow: hidden; }
+.upd-bar span { display: block; height: 100%; width: 0; background: var(--accent); transition: width .3s; }
+.upd-acts { display: flex; gap: 6px; }
 .tab { display: flex; align-items: center; gap: 8px; padding: 8px 10px 8px 12px; border-radius: 7px 7px 0 0; cursor: pointer; max-width: 240px; min-width: 120px; color: var(--muted); border: 1px solid transparent; border-bottom: 0; flex-shrink: 0; }
 .tab:hover { background: color-mix(in srgb, var(--tab) 60%, transparent); }
 .tab.on { background: var(--tab); color: var(--ink); border-color: var(--rule); margin-bottom: -1px; }
@@ -101,7 +114,10 @@ main { flex: 1; min-height: 0; display: flex; }
 </style>
 </head>
 <body>
-<nav class="tabs" id="tabs" aria-label="Open labels"></nav>
+<div class="topline">
+  <nav class="tabs" id="tabs" aria-label="Open labels"></nav>
+  <button class="ver" id="ver" type="button" title="Check for updates">Label Cropper</button>
+</div>
 
 <div class="bar">
   <button class="tool" id="open" title="Open labels (⌘O)">
@@ -117,6 +133,13 @@ main { flex: 1; min-height: 0; display: flex; }
     <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M4 6V1.5h8V6"/><rect x="1.5" y="6" width="13" height="6" rx="1"/><path d="M4 10h8v4.5H4z"/></svg>Print</button>
   <button class="tool primary" id="save" title="Save over the original file (⌘S)" disabled>Save</button>
   <span class="state" id="state"></span>
+</div>
+
+<div class="upd" id="upd" role="status" hidden>
+  <span class="upd-dot" id="updDot"></span>
+  <span class="upd-text" id="updText"></span>
+  <span class="upd-bar" id="updBar" hidden><span id="updFill"></span></span>
+  <span class="upd-acts" id="updActs"></span>
 </div>
 
 <main>
@@ -421,6 +444,70 @@ document.addEventListener("keydown", e => {
 window.addEventListener("beforeunload", e => { if (tabs.some(dirty)) { e.preventDefault(); e.returnValue = ""; } });
 
 // ---------- start ----------
+// ---------- updates ----------
+let upd = null;                 // last check result
+function banner(kind, text, actions = [], progress = null) {
+  const b = $("upd"); b.hidden = false; b.className = "upd" + (kind === "bad" ? " bad" : "");
+  $("updText").textContent = text;
+  $("updBar").hidden = progress === null;
+  if (progress !== null) $("updFill").style.width = progress + "%";
+  const a = $("updActs"); a.textContent = "";
+  for (const [label, fn, primary] of actions) {
+    const btn = document.createElement("button"); btn.type = "button";
+    btn.className = "tool" + (primary ? " primary" : ""); btn.textContent = label; btn.onclick = fn; a.append(btn);
+  }
+}
+const hideBanner = () => { $("upd").hidden = true; };
+
+async function checkUpdates(quiet) {
+  if (!quiet) banner("info", "Checking for updates…");
+  let r;
+  try { r = await api("/api/update/check"); } catch (e) { r = { error: e.message }; }
+  upd = r;
+  const v = $("ver");
+  v.textContent = r.current && r.current !== "dev" ? `Label Cropper ${r.current}` : "Label Cropper";
+  v.classList.toggle("has", !!r.available);
+  if (r.error) { if (!quiet) banner("bad", `Couldn't check for updates. ${r.error}`, [["Try again", () => checkUpdates(false)], ["Close", hideBanner]]); return; }
+  if (r.available) {
+    const note = r.notes ? ` ${r.notes.split("\n")[0].slice(0, 140)}` : "";
+    const arch = r.native ? "" : " (Intel build — runs through Rosetta)";
+    if (!r.installable) { banner("info", `Version ${r.latest} is available${arch}.${note} Updates install from the Label Cropper app in Applications.`, [["Close", hideBanner]]); return; }
+    banner("info", `Version ${r.latest} is available${arch}.${note}`, [["Update now", startUpdate, true], ["Later", hideBanner]]);
+  } else if (!quiet) {
+    banner("info", r.current === "dev" ? "Running from source, so updates are off." : `You're up to date (version ${r.current}).`, [["Close", hideBanner]]);
+    setTimeout(() => { if ($("updText").textContent.startsWith("You're up to date")) hideBanner(); }, 4000);
+  }
+}
+
+async function startUpdate() {
+  if (tabs.some(dirty)) { banner("bad", "Save or undo your unsaved changes first, then update. (Tabs with an orange dot have changes.)", [["OK", () => checkUpdates(true).then(() => upd?.available && checkUpdates(false))]]); return; }
+  if (printing) { banner("bad", "Wait for the current print to finish, then update.", [["OK", () => checkUpdates(false)]]); return; }
+  try { await api("/api/update/start", {}); } catch (e) { banner("bad", `Couldn't start the update. ${e.message}`, [["Try again", () => checkUpdates(false)]]); return; }
+  watchUpdate();
+}
+async function watchUpdate() {
+  let s;
+  try { s = await api("/api/update/status"); } catch (e) { s = { phase: "error", error: e.message }; }
+  if (s.phase === "downloading") banner("info", `Downloading version ${s.version}…`, [], s.progress || 0);
+  else if (s.phase === "verifying") banner("info", "Checking the download (fingerprint, signature, version)…", [], 100);
+  else if (s.phase === "ready") {
+    if (tabs.some(dirty) || printing) { banner("bad", `Version ${s.version} is ready. Save your changes or let the print finish, then click Restart.`, [["Restart to update", installUpdate, true]]); return; }
+    banner("info", `Version ${s.version} is downloaded and checked. Label Cropper will close and reopen.`, [["Restart to update", installUpdate, true], ["Later", hideBanner]]); return;
+  }
+  else if (s.phase === "error") { banner("bad", `Update not installed. ${s.error} Your current version is unchanged.`, [["Try again", () => checkUpdates(false)], ["Close", hideBanner]]); return; }
+  else if (s.phase === "installing") { banner("info", "Installing… Label Cropper will reopen in a moment."); return; }
+  setTimeout(watchUpdate, 500);
+}
+async function installUpdate() {
+  if (tabs.some(dirty)) { banner("bad", "Save or undo your unsaved changes first.", [["Restart to update", installUpdate, true]]); return; }
+  if (printing) { banner("bad", "Wait for the current print to finish.", [["Restart to update", installUpdate, true]]); return; }
+  try { await api("/api/update/install", {}); banner("info", "Installing… Label Cropper will reopen in a moment."); }
+  catch (e) { banner("bad", `Couldn't install. ${e.message}`, [["Close", hideBanner]]); }
+}
+$("ver").onclick = () => checkUpdates(false);
+setTimeout(() => checkUpdates(true), 2500);
+setInterval(() => { if (!upd?.available) checkUpdates(true); }, 6 * 60 * 60 * 1000);
+
 drawTabs(); refresh(); loadPrinters();
 </script>
 </body>
