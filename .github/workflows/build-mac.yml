@@ -46,6 +46,7 @@ jobs:
             --osx-bundle-identifier com.danezeeb.labelcropper \
             --add-data "app.html:." \
             --hidden-import updater \
+            --exclude-module tkinter --exclude-module _tkinter --exclude-module test \
             --collect-all pypdfium2 --collect-all pypdfium2_raw \
             label_cropper.py
           APP="dist/Label Cropper.app"
@@ -63,6 +64,16 @@ jobs:
 
       - name: Self-test the packaged app
         run: '"dist/Label Cropper.app/Contents/MacOS/Label Cropper" --selftest'
+
+      - name: Measure startup and size
+        run: |
+          APP="dist/Label Cropper.app"
+          echo "App size: $(du -sh "$APP" | cut -f1), files: $(find "$APP" -type f | wc -l | tr -d ' ')"
+          echo "Largest parts:"; du -sk "$APP"/Contents/*/* 2>/dev/null | sort -rn | head -12
+          for run in first second third; do
+            echo "--- $run launch"
+            /usr/bin/time -p "$APP/Contents/MacOS/Label Cropper" --startup-timing 2>&1 | grep -E "^\[|^real"
+          done
 
       - name: Make installer disk image
         run: |

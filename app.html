@@ -405,7 +405,7 @@ function shortProblem(n) {
   return "needs attention";
 }
 // keep printer status fresh without rebuilding the menu while it's open
-setInterval(() => { if (!printing && document.activeElement !== $("printer")) loadPrinters(); }, 10000);
+setInterval(() => { if (!printing && !document.hidden && document.activeElement !== $("printer")) loadPrinters(); }, 15000);
 window.addEventListener("focus", () => { if (!printing) loadPrinters(); });
 $("printer").onchange = e => { try { localStorage.setItem("lc-printer", e.target.value); } catch {} };
 
@@ -508,7 +508,9 @@ $("ver").onclick = () => checkUpdates(false);
 setTimeout(() => checkUpdates(true), 2500);
 setInterval(() => { if (!upd?.available) checkUpdates(true); }, 6 * 60 * 60 * 1000);
 
-drawTabs(); refresh(); loadPrinters();
+drawTabs(); refresh();
+fetch("/api/ready").catch(() => {});
+setTimeout(loadPrinters, 0);
 </script>
 </body>
 </html>

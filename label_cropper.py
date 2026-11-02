@@ -23,6 +23,9 @@ Checks run before a save is accepted (any failure = nothing is written)
   5. Actual size: the label is not scaled, so barcodes print at their original size.
 """
 import hashlib
+import time
+_T0 = time.monotonic()                      # for the startup timings in the log
+
 import io
 import json
 import os
@@ -37,12 +40,54 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-import numpy as np
-import pypdfium2 as pdfium
-from pypdf import PdfReader, PdfWriter
-from pypdf.generic import NameObject, NumberObject, RectangleObject
+import importlib
 import logging
-logging.getLogger("pypdf").setLevel(logging.ERROR)
+
+
+# The PDF libraries take most of the startup time (numpy alone ~0.4 s, more under Rosetta), so
+# they load in the background while the window opens. Code below uses them as if imported.
+class _Lazy:
+    def __init__(self, module, attr=None):
+        self._module, self._attr, self._obj = module, attr, None
+
+    def _load(self):
+        if self._obj is None:
+            m = importlib.import_module(self._module)
+            self._obj = getattr(m, self._attr) if self._attr else m
+            if self._module.startswith("pypdf"):
+                logging.getLogger("pypdf").setLevel(logging.ERROR)
+        return self._obj
+
+    def __getattr__(self, name):
+        return getattr(self._load(), name)
+
+    def __call__(self, *a, **k):
+        return self._load()(*a, **k)
+
+
+np = _Lazy("numpy")
+pdfium = _Lazy("pypdfium2")
+PdfReader = _Lazy("pypdf", "PdfReader")
+PdfWriter = _Lazy("pypdf", "PdfWriter")
+NameObject = _Lazy("pypdf.generic", "NameObject")
+NumberObject = _Lazy("pypdf.generic", "NumberObject")
+RectangleObject = _Lazy("pypdf.generic", "RectangleObject")
+
+
+def warm_up():
+    """Load the PDF libraries and draw one tiny page, so the first real label is instant."""
+    t = time.monotonic()
+    for lazy in (np, pdfium, PdfReader, NameObject):
+        lazy._load()
+    try:
+        _render_displayed(_synthetic_label(), 0, 0.1)
+    except Exception:
+        pass
+    startup_log(f"PDF libraries ready in {time.monotonic() - t:.2f}s")
+
+
+def startup_log(msg):
+    print(f"[{time.monotonic() - _T0:6.2f}s] {msg}", flush=True)
 
 # PDFium is not thread-safe, and the window's server answers requests on several threads at
 # once (previews, saves, print checks). Every use of PDFium goes through this one lock;
@@ -79,8 +124,24 @@ def _ink_bbox(arr):
     return xs.min(), ys.min(), xs.max(), ys.max()
 
 
-@_pdfium_serialized
+_INK_CACHE = {}
+
+
 def ink_bounds(pdf_bytes, page_index=0):
+    """Cached: opening a tab, cropping and saving all ask the same question of the same bytes."""
+    import hashlib
+    key = (hashlib.sha1(pdf_bytes).digest(), page_index)
+    hit = _INK_CACHE.get(key)
+    if hit is None:
+        hit = _ink_bounds(pdf_bytes, page_index)
+        if len(_INK_CACHE) > 64:
+            _INK_CACHE.clear()
+        _INK_CACHE[key] = hit
+    return hit
+
+
+@_pdfium_serialized
+def _ink_bounds(pdf_bytes, page_index=0):
     """Bounds of all ink on the whole MediaBox, in PDF user-space points (l, b, r, t)."""
     doc = pdfium.PdfDocument(pdf_bytes)
     try:
@@ -773,6 +834,9 @@ def make_handler(app):
             try:
                 if u.path == "/":
                     return self._send(200, (HERE / "app.html").read_text(encoding="utf-8"), "text/html; charset=utf-8")
+                if u.path == "/api/ready":
+                    startup_log(f"window ready (process running {_process_age()})")
+                    return self._send(200, {"ok": True})
                 if u.path == "/api/printers":
                     return self._send(200, printers())
                 if u.path == "/api/update/check":
@@ -885,6 +949,16 @@ def make_handler(app):
     return H
 
 
+def _process_age():
+    """How long since macOS started this process, including time before Python ran."""
+    try:
+        out = subprocess.run(["ps", "-o", "etime=", "-p", str(os.getpid())],
+                             capture_output=True, text=True, timeout=3).stdout.strip()
+        return out + " since launch"
+    except Exception:
+        return "unknown"
+
+
 def start_server(port=8737):
     app = App()
     for p in range(port, port + 50):
@@ -910,8 +984,12 @@ def run_browser(port):
 
 def run_window(port):
     global WINDOW
+    startup_log("starting")
+    threading.Thread(target=warm_up, daemon=True).start()
     import webview
+    startup_log("window toolkit loaded")
     url = start_server(port)
+    startup_log("server ready")
     WINDOW = webview.create_window("Label Cropper", url, width=1180, height=880, min_size=(720, 560),
                                    background_color="#2a2d31")
     webview.start(private_mode=False)
@@ -996,7 +1074,7 @@ def _setup_logging():
         log = open(logdir / "label-cropper.log", "a", buffering=1, encoding="utf-8")
     except Exception:
         return
-    cli = any(a.startswith("--") and "selftest" in a for a in sys.argv)   # tests print to the terminal
+    cli = any(a in ("--selftest", "--update-selftest", "--startup-timing") for a in sys.argv)  # print to terminal
     if sys.stderr is None or (getattr(sys, "frozen", False) and not cli):
         sys.stderr = log
     if sys.stdout is None or (getattr(sys, "frozen", False) and not cli):
@@ -1012,7 +1090,16 @@ def _setup_logging():
 if __name__ == "__main__":
     _setup_logging()
     port = int(os.environ.get("LABEL_PORT", 8737))
-    if "--selftest" in sys.argv:
+    if "--startup-timing" in sys.argv:
+        startup_log("python started")
+        warm_up()
+        url = start_server(port)
+        startup_log("server ready")
+        d = _synthetic_label()
+        t = time.monotonic(); make_plan(d); status_of(d)
+        startup_log(f"first label analysed in {time.monotonic() - t:.2f}s")
+        startup_log(f"total (process running {_process_age()})")
+    elif "--selftest" in sys.argv:
         selftest()
     elif "--update-selftest" in sys.argv:
         import updater
