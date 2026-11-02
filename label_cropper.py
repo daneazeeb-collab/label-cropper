@@ -210,6 +210,70 @@ def _render_displayed(pdf_bytes, page_index, scale, window=None, rotation=None):
         doc.close()
 
 
+def print_copy(pdf_bytes, page_index=0):
+    """A one-page PDF for the printer: exactly the label, upright, with the page starting at 0,0.
+
+    Printers differ in whether they honour a PDF's crop window and rotation. Some use the full
+    letter page instead and print a blank corner of it. This copy has no window and no rotation
+    left to interpret: the page *is* the label. The drawing is wrapped, not changed.
+    """
+    from pypdf import Transformation
+    w = PdfWriter()
+    w.append(PdfReader(io.BytesIO(pdf_bytes)), pages=[page_index])
+    page = w.pages[0]
+    cb = page.cropbox
+    l, b, r, t = float(cb.left), float(cb.bottom), float(cb.right), float(cb.top)
+    rot = int(page.get("/Rotate", 0) or 0) % 360
+    W, H = r - l, t - b
+    # move the window to the origin, then turn it clockwise by `rot` the way a viewer would
+    tr = Transformation().translate(-l, -b)
+    if rot == 90:
+        tr = tr.rotate(-90).translate(0, W)
+        W, H = H, W
+    elif rot == 180:
+        tr = tr.rotate(180).translate(W, H)
+    elif rot == 270:
+        tr = tr.rotate(90).translate(H, 0)
+        W, H = H, W
+    page.add_transformation(tr)
+    box = RectangleObject([0, 0, W, H])
+    for name in ("/MediaBox", "/CropBox", "/TrimBox", "/BleedBox", "/ArtBox"):
+        if name in page or name in ("/MediaBox", "/CropBox"):
+            page[NameObject(name)] = box
+    page[NameObject("/Rotate")] = NumberObject(0)
+    out = io.BytesIO()
+    w.write(out)
+    return out.getvalue()
+
+
+def check_print_copy(source, copy, page_index=0):
+    """The printer copy must look exactly like the label on screen, and must not be blank."""
+    s = 150 / PT
+    want = _render_displayed(source, page_index, s)
+    got = _render_displayed(copy, 0, s)
+    r = PdfReader(io.BytesIO(copy)).pages[0]
+    mb = [float(v) for v in r.mediabox]
+    framed = mb[0] == 0 and mb[1] == 0 and int(r.get("/Rotate", 0) or 0) == 0
+    if _ink_bbox(got) is None:
+        return False, "The page for the printer came out blank."
+    if not framed:
+        return False, "The page for the printer isn't framed correctly."
+    if abs(got.shape[0] - want.shape[0]) > 2 or abs(got.shape[1] - want.shape[1]) > 2:
+        return False, "The page for the printer is a different size from the label."
+    # The two are drawn by different routes (rotated view vs. rotated page), so edges can land a
+    # pixel apart. Compare at a third of the resolution: that absorbs rounding but still catches
+    # a label that is shifted, turned, cut off or missing.
+    from PIL import Image
+    n = 200
+    m = max(1, round(n * want.shape[0] / want.shape[1]))
+    A = np.asarray(Image.fromarray(want).convert("L").resize((n, m), Image.BOX), float)
+    B = np.asarray(Image.fromarray(got).convert("L").resize((n, m), Image.BOX), float)
+    d = np.abs(A - B)
+    if d.mean() > 10 or d.max() > 140:
+        return False, "The page for the printer doesn't match the label on screen."
+    return True, f"Sending a {mb[2]/PT:.2f} × {mb[3]/PT:.2f} in page that matches the preview."
+
+
 def verify(orig, new, plan, page_index=0):
     checks = []
 
@@ -500,7 +564,8 @@ def diagnose(state, accepting, reasons, message):
 def printer_status(name):
     status, a = ipp(0x000B, f"/printers/{name}", "printer-uri", f"ipp://localhost/printers/{name}",
                     want=("printer-state", "printer-state-reasons", "printer-state-message",
-                          "printer-is-accepting-jobs", "printer-info", "device-uri"))
+                          "printer-is-accepting-jobs", "printer-info", "device-uri",
+                          "media-supported", "media-default"))
     if status >= 0x0400:
         raise RuntimeError("macOS doesn't know a printer by that name any more.")
     state = PRINTER_STATES.get((a.get("printer-state") or [0])[0], "unknown")
@@ -510,7 +575,35 @@ def printer_status(name):
     problem, fix = diagnose(state, accepting, reasons, message)
     return {"name": name, "label": ((a.get("printer-info") or [""])[0] or name.replace("_", " ")),
             "state": state, "accepting": accepting, "reasons": reasons, "message": message,
-            "problem": problem, "fix": fix}
+            "problem": problem, "fix": fix,
+            "media": a.get("media-supported") or [], "media_default": (a.get("media-default") or [""])[0]}
+
+
+_MEDIA_SIZE = re.compile(r"_(\d+(?:\.\d+)?)x(\d+(?:\.\d+)?)(in|mm)$")
+
+
+def media_size(name):
+    """Size in inches from a PWG media name like 'na_index-4x6_4x6in', or None."""
+    m = _MEDIA_SIZE.search(name or "")
+    if not m:
+        return None
+    w, h = float(m.group(1)), float(m.group(2))
+    if m.group(3) == "mm":
+        w, h = w / 25.4, h / 25.4
+    return w, h
+
+
+def pick_media(status, w_in, h_in):
+    """The printer's own name for paper of this size, if it has one."""
+    def fits(name):
+        sz = media_size(name)
+        return sz and sorted((round(sz[0], 1), round(sz[1], 1))) == sorted((round(w_in, 1), round(h_in, 1)))
+    if fits(status.get("media_default")):
+        return status["media_default"]
+    for m in status.get("media") or []:
+        if fits(m):
+            return m
+    return None
 
 
 def printers():
@@ -546,19 +639,23 @@ def lpstat_status(name):
     return {"problem": None, "fix": None}
 
 
-def submit(pdf_bytes, printer, title, oversize):
+def submit(pdf_bytes, printer, title, oversize, media=None):
     """Hand the label to macOS. Returns the job's request id, e.g. 'Rollo-42'."""
     with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tf:
         tf.write(pdf_bytes)
         tmp = tf.name
     cmd = ["lp", "-d", printer, "-t", title]
     cmd += ["-o", "fit-to-page"] if oversize else ["-o", "scaling=100"]
+    if media:
+        cmd += ["-o", f"media={media}"]
     cmd.append(tmp)
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         out = (r.stdout + r.stderr).strip()
         if r.returncode != 0:
-            raise RuntimeError(out or "macOS refused the print job.")
+            if "does not exist" in out or "nvalid destination" in out:
+                raise RuntimeError("macOS doesn't know a printer by that name any more. Nothing was sent.")
+            raise RuntimeError((out or "macOS refused the print job.") + " Nothing was sent.")
         m = re.search(r"request id is (\S+)", out)
         if not m:
             raise RuntimeError(f"macOS didn't confirm the print job. It said: {out or 'nothing'}")
@@ -727,7 +824,24 @@ def make_handler(app):
                         p = lpstat_status(d["printer"])        # fallback when status can't be read
                     if p["problem"]:
                         return self._send(200, {"ok": False, "problem": p["problem"], "fix": p["fix"]})
-                    job = submit(new, d["printer"], Path(path).stem, plan["oversize"])
+                    copy = print_copy(new)
+                    good, why = check_print_copy(new, copy)
+                    if not good:
+                        return self._send(200, {"ok": False, "problem": why})
+                    pg = PdfReader(io.BytesIO(copy)).pages[0]
+                    w_in, h_in = float(pg.mediabox.width) / PT, float(pg.mediabox.height) / PT
+                    knows_media = bool(p.get("media") or p.get("media_default"))
+                    media = pick_media(p, w_in, h_in) if knows_media else None
+                    if knows_media and not media and plan["crop"] and plan["oversize"]:
+                        media = pick_media(p, 4, 6)          # larger label: shrink onto 4 x 6 stock
+                    if knows_media and not media:
+                        have = media_size(p.get("media_default")) or ()
+                        size = f"{have[0]:g} × {have[1]:g} in" if have else "a different size of"
+                        hint = " Click Crop to 4×6 first." if not plan["crop"] and pick_media(p, 4, 6) else ""
+                        return self._send(200, {"ok": False, "problem":
+                            f"This page is {w_in:.2f} × {h_in:.2f} in, but the printer takes {size} "
+                            f"labels.{hint}"})
+                    job = submit(copy, d["printer"], Path(path).stem, plan["oversize"], media)
                     return self._send(200, {"ok": True, "job": job})
                 if u.path == "/api/cancel":
                     cancel_job(d["job"])
@@ -818,6 +932,13 @@ def selftest():
         print(("PASS " if c["ok"] else "FAIL ") + c["name"] + ": " + c["detail"])
     after = p.read_bytes()
     assert ok and after.startswith(before) and status_of(after) == "cropped", "self-test failed"
+    good, why = check_print_copy(after, print_copy(after))
+    assert good, why
+    pc = PdfReader(io.BytesIO(print_copy(after))).pages[0]
+    assert [float(v) for v in pc.mediabox] == [0, 0, 288, 432] and int(pc.get("/Rotate", 0)) == 0
+    print("PASS Printer copy: exact 4 x 6 page, upright, matches the preview")
+    assert pick_media({"media": ["na_letter_8.5x11in", "na_index-4x6_4x6in"]}, 4, 6) == "na_index-4x6_4x6in"
+    assert pick_media({"media": ["na_letter_8.5x11in"]}, 4, 6) is None
     # the window's server works on several threads at once; PDFium must survive that
     errors = []
 
