@@ -10,7 +10,16 @@ permissions:
 
 jobs:
   build:
-    runs-on: macos-latest      # Apple Silicon
+    # Two kinds of Mac build machine, so one busy pool doesn't block a release.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: AppleSilicon
+          - runner: macos-15-intel
+            arch: Intel
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -57,14 +66,14 @@ jobs:
           mkdir dmg
           cp -R "dist/Label Cropper.app" dmg/
           ln -s /Applications dmg/Applications
-          hdiutil create -volname "Label Cropper" -srcfolder dmg -ov -format UDZO "Label-Cropper.dmg"
-          hdiutil verify "Label-Cropper.dmg"
-          ls -lh "Label-Cropper.dmg"
+          hdiutil create -volname "Label Cropper" -srcfolder dmg -ov -format UDZO "Label-Cropper-${{ matrix.arch }}.dmg"
+          hdiutil verify "Label-Cropper-${{ matrix.arch }}.dmg"
+          ls -lh "Label-Cropper-${{ matrix.arch }}.dmg"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: Label-Cropper-mac
-          path: Label-Cropper.dmg
+          name: Label-Cropper-${{ matrix.arch }}
+          path: Label-Cropper-${{ matrix.arch }}.dmg
           retention-days: 90
 
       - name: Publish release
@@ -73,8 +82,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           TAG="v1.0.${GITHUB_RUN_NUMBER}"
-          gh release create "$TAG" "Label-Cropper.dmg" \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "Label Cropper $TAG" \
-            --notes "Open the .dmg and drag Label Cropper into Applications." \
-            --latest
+          FILE="Label-Cropper-${{ matrix.arch }}.dmg"
+          # whichever machine finishes first creates the release; the other adds its file
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "Label Cropper $TAG" \
+            --notes "Open the .dmg for your Mac (AppleSilicon or Intel) and drag Label Cropper into Applications." \
+            --latest 2>/dev/null || true
+          gh release upload "$TAG" "$FILE" --repo "$GITHUB_REPOSITORY" --clobber
