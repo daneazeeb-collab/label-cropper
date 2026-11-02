@@ -959,11 +959,24 @@ def _process_age():
         return "unknown"
 
 
+class _LocalServer(ThreadingHTTPServer):
+    """Python's server looks up this computer's network name when it starts (socket.getfqdn).
+    On many Macs that lookup waits on DNS/Bonjour timeouts for several seconds on every launch.
+    The app only talks to itself on 127.0.0.1, so skip it."""
+    daemon_threads = True
+
+    def server_bind(self):
+        import socketserver
+        socketserver.TCPServer.server_bind(self)
+        self.server_name = "localhost"
+        self.server_port = self.server_address[1]
+
+
 def start_server(port=8737):
     app = App()
     for p in range(port, port + 50):
         try:
-            srv = ThreadingHTTPServer(("127.0.0.1", p), make_handler(app))
+            srv = _LocalServer(("127.0.0.1", p), make_handler(app))
             break
         except OSError:
             continue
