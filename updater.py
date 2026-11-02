@@ -371,7 +371,7 @@ def selftest(dmg, version):
     assert not staged.exists()
     _run(["codesign", "--verify", "--deep", "--strict", str(old)], "installed app signature")
     r = subprocess.run([str(old / "Contents" / "MacOS" / "Label Cropper"), "--selftest"], capture_output=True, text=True)
-    assert "SELFTEST OK" in r.stdout, r.stdout + r.stderr
+    assert r.returncode == 0 and "SELFTEST OK" in r.stdout, f"exit {r.returncode}: {r.stdout[-800:]} {r.stderr[-800:]}"
     print(f"PASS Updated 1.0.0 -> {version}; previous version kept; updated app passes its self-test")
     shutil.rmtree(root, ignore_errors=True)
     print("UPDATE SELFTEST OK")

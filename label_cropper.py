@@ -996,9 +996,10 @@ def _setup_logging():
         log = open(logdir / "label-cropper.log", "a", buffering=1, encoding="utf-8")
     except Exception:
         return
-    if sys.stderr is None or getattr(sys, "frozen", False):
+    cli = any(a.startswith("--") and "selftest" in a for a in sys.argv)   # tests print to the terminal
+    if sys.stderr is None or (getattr(sys, "frozen", False) and not cli):
         sys.stderr = log
-    if sys.stdout is None or getattr(sys, "frozen", False):
+    if sys.stdout is None or (getattr(sys, "frozen", False) and not cli):
         sys.stdout = log
     faulthandler.enable(file=log, all_threads=True)
     log.write(f"\n--- started {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
