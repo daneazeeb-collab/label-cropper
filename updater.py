@@ -45,6 +45,10 @@ if alive; then
   echo "update helper: app did not quit; update skipped"; rm -rf "$NEW"; exit 1
 fi
 mkdir -p "$(dirname "$BAK")"; rm -rf "$BAK"
+if [ ! -e "$CUR" ]; then
+  if mv "$NEW" "$CUR"; then echo "update helper: installed $CUR"; [ "$REOPEN" = 1 ] && open "$CUR"; exit 0; fi
+  echo "update helper: could not install $CUR"; exit 1
+fi
 if ! mv "$CUR" "$BAK"; then
   echo "update helper: could not move the current app aside; update skipped"
   rm -rf "$NEW"; [ "$REOPEN" = 1 ] && open "$CUR"; exit 1
@@ -84,6 +88,108 @@ def installed_app():
         if parent.suffix == ".app":
             return parent
     return None
+
+
+APPLICATIONS = Path("/Applications")
+
+
+def _original_of_translocated(app):
+    """Ask macOS where a translocated app really lives (Security framework, macOS 10.12+)."""
+    import ctypes
+    cf = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+    sec = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/Security.framework/Security")
+    cf.CFURLCreateFromFileSystemRepresentation.restype = ctypes.c_void_p
+    cf.CFURLCreateFromFileSystemRepresentation.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_long, ctypes.c_bool]
+    cf.CFURLGetFileSystemRepresentation.restype = ctypes.c_bool
+    cf.CFURLGetFileSystemRepresentation.argtypes = [ctypes.c_void_p, ctypes.c_bool, ctypes.c_char_p, ctypes.c_long]
+    cf.CFRelease.argtypes = [ctypes.c_void_p]
+    sec.SecTranslocateIsTranslocatedURL.restype = ctypes.c_bool
+    sec.SecTranslocateIsTranslocatedURL.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_bool), ctypes.c_void_p]
+    sec.SecTranslocateCreateOriginalPathForURL.restype = ctypes.c_void_p
+    sec.SecTranslocateCreateOriginalPathForURL.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    raw = str(app).encode()
+    url = cf.CFURLCreateFromFileSystemRepresentation(None, raw, len(raw), True)
+    if not url:
+        return None
+    try:
+        moved = ctypes.c_bool(False)
+        if not sec.SecTranslocateIsTranslocatedURL(url, ctypes.byref(moved), None) or not moved.value:
+            return None
+        orig = sec.SecTranslocateCreateOriginalPathForURL(url, None)
+        if not orig:
+            return None
+        try:
+            buf = ctypes.create_string_buffer(4096)
+            if cf.CFURLGetFileSystemRepresentation(orig, True, buf, len(buf)):
+                return Path(buf.value.decode())
+        finally:
+            cf.CFRelease(orig)
+    finally:
+        cf.CFRelease(url)
+    return None
+
+
+def location_problem(app=None):
+    """Is macOS running this app from somewhere that makes it slow and blocks updates?
+
+    'translocated': macOS runs downloaded apps that are still marked as quarantined from a
+    temporary read-only copy (AppTranslocation). It recreates and rescans that copy on every
+    launch, and nothing can be written there, so updates can't install.
+    'disk-image': running straight from the installer .dmg, which is read-only too.
+    """
+    app = app or installed_app()
+    if app is None:
+        return None
+    s = str(app)
+    if "/AppTranslocation/" in s:
+        orig = None
+        try:
+            orig = _original_of_translocated(app)
+        except Exception as e:
+            _log(f"couldn't ask macOS for the original location: {e}")
+        if orig is None and (APPLICATIONS / app.name).exists():
+            orig = APPLICATIONS / app.name
+        return {"kind": "translocated", "running": s, "original": str(orig) if orig else None}
+    if s.startswith("/Volumes/"):
+        return {"kind": "disk-image", "running": s, "original": s}
+    return None
+
+
+def install_target(app):
+    """Where updates should go: the real app, not macOS's temporary copy of it."""
+    prob = location_problem(app)
+    if prob and prob["kind"] == "translocated" and prob.get("original") \
+            and not prob["original"].startswith("/Volumes/"):
+        return Path(prob["original"])
+    if prob:
+        return APPLICATIONS / app.name
+    return app
+
+
+def fix_location(quit_fn, pid=None, reopen=True):
+    """Put a clean copy in Applications (no quarantine mark), then quit and reopen from there."""
+    app = installed_app()
+    prob = location_problem(app)
+    if not prob:
+        raise RuntimeError("Label Cropper is already running from its normal place.")
+    source = Path(prob.get("original") or app)
+    if not source.exists():
+        source = app
+    target = APPLICATIONS / app.name
+    if not os.access(APPLICATIONS, os.W_OK):
+        raise RuntimeError("The app can't write to the Applications folder. Drag Label Cropper into "
+                           "Applications in Finder, then open it from there.")
+    staged = APPLICATIONS / f".{app.stem}.update.app"
+    shutil.rmtree(staged, ignore_errors=True)
+    _run(["ditto", str(source), str(staged)], "Couldn't copy Label Cropper into Applications.")
+    subprocess.run(["xattr", "-dr", "com.apple.quarantine", str(staged)], capture_output=True)
+    check_app(staged, app_version(staged))
+    if target.exists():
+        subprocess.run(["xattr", "-dr", "com.apple.quarantine", str(target)], capture_output=True)
+    _log(f"fixing location: {prob['kind']} from {prob['running']}; installing clean copy at {target}")
+    launch_swap(target, staged, SUPPORT / "Previous Version" / app.name, reopen=reopen, pid=pid)
+    threading.Timer(0.4, quit_fn).start()
+    return {"target": str(target)}
 
 
 def app_version(app=None):
@@ -142,6 +248,7 @@ def check(fetch=None):
             break
     newer = parse_version(latest) > parse_version(cur) if cur != "dev" else False
     return {"current": cur, "latest": latest, "available": bool(newer and pick), "asset": pick,
+            "location": location_problem(),
             "notes": (data.get("body") or "").strip()[:2000], "published": data.get("published_at"),
             "installable": installed_app() is not None,
             "native": bool(pick and pick["arch"] == want)}
@@ -174,6 +281,7 @@ class Updater:
             app = installed_app()
             if app is None:
                 raise RuntimeError("Updates only work in the installed app.")
+            app = install_target(app)
             staged = prepare(info, app, progress=lambda p: self._set(progress=p),
                              phase=lambda ph: self._set(phase=ph))
             self.ready = (app, staged, SUPPORT / "Previous Version" / app.name)
@@ -198,8 +306,8 @@ def prepare(info, app, progress=lambda p: None, phase=lambda p: None, download=N
     if not asset:
         raise RuntimeError("This release has no installer for this Mac.")
     if not os.access(app.parent, os.W_OK):
-        raise RuntimeError(f"The app can't write to {app.parent}. Install this update by hand: "
-                           "open the .dmg and drag Label Cropper into Applications.")
+        raise RuntimeError(f"The app can't write to {app.parent}. Use “Fix and restart” in the bar above, "
+                           "or drag Label Cropper into Applications in Finder and open it from there.")
     CACHE.mkdir(parents=True, exist_ok=True)
     dmg = CACHE / f"Label-Cropper-{info['latest']}-{asset['arch']}.dmg"
     want_sha = _expected_sha(asset)
@@ -259,13 +367,13 @@ def check_app(app, version):
         raise RuntimeError("The new version's code signature is broken, so it wasn't installed. Nothing was changed.")
 
 
-def launch_swap(cur, staged, backup, reopen=True):
+def launch_swap(cur, staged, backup, reopen=True, pid=None):
     SUPPORT.mkdir(parents=True, exist_ok=True)
     script = SUPPORT / "apply-update.sh"
     script.write_text(SWAP_SCRIPT)
     script.chmod(0o755)
     LOG.parent.mkdir(parents=True, exist_ok=True)
-    subprocess.Popen(["/bin/bash", str(script), str(os.getpid()), str(cur), str(staged), str(backup),
+    subprocess.Popen(["/bin/bash", str(script), str(pid or os.getpid()), str(cur), str(staged), str(backup),
                       str(LOG), "1" if reopen else "0"],
                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                      start_new_session=True, close_fds=True)
@@ -373,5 +481,33 @@ def selftest(dmg, version):
     r = subprocess.run([str(old / "Contents" / "MacOS" / "Label Cropper"), "--selftest"], capture_output=True, text=True)
     assert r.returncode == 0 and "SELFTEST OK" in r.stdout, f"exit {r.returncode}: {r.stdout[-800:]} {r.stderr[-800:]}"
     print(f"PASS Updated 1.0.0 -> {version}; previous version kept; updated app passes its self-test")
+    # fix a translocated, quarantined copy for real: clean copy lands in "Applications"
+    global APPLICATIONS
+    tdir = root / "T" / "AppTranslocation" / "ABC" / "d"
+    tdir.mkdir(parents=True)
+    _run(["ditto", str(old), str(tdir / old.name)], "copy")
+    subprocess.run(["xattr", "-w", "com.apple.quarantine", "0081;00000000;Safari;", str(tdir / old.name)], check=True)
+    APPLICATIONS = root / "Apps"
+    APPLICATIONS.mkdir()
+    os.environ["LABEL_TEST_APP"] = str(tdir / old.name)
+    stand_in = subprocess.Popen(["sleep", "1"])
+    fix_location(lambda: None, pid=stand_in.pid, reopen=False)
+    fixed = APPLICATIONS / old.name
+    for _ in range(100):
+        if fixed.exists() and not (APPLICATIONS / f".{old.stem}.update.app").exists():
+            break
+        time.sleep(0.2)
+    del os.environ["LABEL_TEST_APP"]
+    assert fixed.exists(), "fix did not install into Applications"
+    q = subprocess.run(["xattr", "-p", "com.apple.quarantine", str(fixed)], capture_output=True)
+    assert q.returncode != 0, "quarantine mark still present"
+    _run(["codesign", "--verify", "--deep", "--strict", str(fixed)], "fixed app signature")
+    print("PASS Fix: quarantined temporary copy -> clean copy in Applications, signature intact")
+    assert location_problem(Path("/Applications/Label Cropper.app")) is None
+    assert _original_of_translocated(Path("/Applications")) is None      # Security calls load and answer
+    fake = Path("/private/var/folders/x/T/AppTranslocation/ABC/d/Label Cropper.app")
+    assert location_problem(fake)["kind"] == "translocated"
+    assert location_problem(Path("/Volumes/Label Cropper/Label Cropper.app"))["kind"] == "disk-image"
+    print("PASS Detects running from macOS's temporary copy or the installer disk image")
     shutil.rmtree(root, ignore_errors=True)
     print("UPDATE SELFTEST OK")

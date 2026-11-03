@@ -930,6 +930,9 @@ def make_handler(app):
                         raise ValueError("Check for updates first.")
                     app.updater.start(app.update_info)
                     return self._send(200, app.updater.status())
+                if u.path == "/api/fix-location":
+                    import updater
+                    return self._send(200, updater.fix_location(_quit_app))
                 if u.path == "/api/update/install":
                     app.updater.install_and_quit(_quit_app)
                     return self._send(200, {"ok": True})

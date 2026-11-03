@@ -468,6 +468,12 @@ async function checkUpdates(quiet) {
   v.textContent = r.current && r.current !== "dev" ? `Label Cropper ${r.current}` : "Label Cropper";
   v.classList.toggle("has", !!r.available);
   if (r.error) { if (!quiet) banner("bad", `Couldn't check for updates. ${r.error}`, [["Try again", () => checkUpdates(false)], ["Close", hideBanner]]); return; }
+  if (r.location && !r.available) {
+    const where = r.location.kind === "disk-image" ? "straight from the installer disk image" : "from a temporary read-only copy that macOS made";
+    banner("bad", `Label Cropper is running ${where}. That makes it slow to open and stops updates from installing. Fix it by putting a clean copy in Applications and reopening from there.`,
+      [["Fix and restart", fixLocation, true], ["Later", hideBanner]]);
+    return;
+  }
   if (r.available) {
     const note = r.notes ? ` ${r.notes.split("\n")[0].slice(0, 140)}` : "";
     const arch = r.native ? "" : " (Intel build — runs through Rosetta)";
@@ -477,6 +483,13 @@ async function checkUpdates(quiet) {
     banner("info", r.current === "dev" ? "Running from source, so updates are off." : `You're up to date (version ${r.current}).`, [["Close", hideBanner]]);
     setTimeout(() => { if ($("updText").textContent.startsWith("You're up to date")) hideBanner(); }, 4000);
   }
+}
+
+async function fixLocation() {
+  if (tabs.some(dirty)) { banner("bad", "Save or undo your unsaved changes first.", [["Fix and restart", fixLocation, true]]); return; }
+  if (printing) { banner("bad", "Wait for the current print to finish.", [["Fix and restart", fixLocation, true]]); return; }
+  try { const r = await api("/api/fix-location", {}); banner("info", `Moving Label Cropper to ${r.target} and reopening…`); }
+  catch (e) { banner("bad", `Couldn't fix it automatically. ${e.message}`, [["Close", hideBanner]]); }
 }
 
 async function startUpdate() {
