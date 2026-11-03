@@ -478,6 +478,7 @@ async function checkUpdates(quiet) {
     const note = r.notes ? ` ${r.notes.split("\n")[0].slice(0, 140)}` : "";
     const arch = r.native ? "" : " (Intel build — runs through Rosetta)";
     if (!r.installable) { banner("info", `Version ${r.latest} is available${arch}.${note} Updates install from the Label Cropper app in Applications.`, [["Close", hideBanner]]); return; }
+    if (r.switch_to_native) { banner("info", `A version built for Apple Silicon Macs is ready. It opens faster than the Intel version you have now.`, [["Switch now", startUpdate, true], ["Later", hideBanner]]); return; }
     banner("info", `Version ${r.latest} is available${arch}.${note}`, [["Update now", startUpdate, true], ["Later", hideBanner]]);
   } else if (!quiet) {
     banner("info", r.current === "dev" ? "Running from source, so updates are off." : `You're up to date (version ${r.current}).`, [["Close", hideBanner]]);

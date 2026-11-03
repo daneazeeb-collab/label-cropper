@@ -217,6 +217,16 @@ def this_arch():
     return "AppleSilicon"
 
 
+def running_under_rosetta():
+    if platform.machine().lower() != "x86_64":
+        return False
+    try:
+        r = subprocess.run(["sysctl", "-n", "sysctl.proc_translated"], capture_output=True, text=True)
+        return r.stdout.strip() == "1"
+    except Exception:
+        return False
+
+
 def _curl(args, timeout=60):
     r = subprocess.run(["curl", "-fsSL", "--retry", "2", "--connect-timeout", "15", *args],
                        capture_output=True, timeout=timeout)
@@ -247,8 +257,12 @@ def check(fetch=None):
                     "sha_url": sha["browser_download_url"]}
             break
     newer = parse_version(latest) > parse_version(cur) if cur != "dev" else False
+    # same version, but this is the Intel build on an Apple Silicon Mac and the native one now exists
+    switch = (not newer and cur != "dev" and parse_version(latest) == parse_version(cur)
+              and running_under_rosetta() and bool(pick) and pick["arch"] == "AppleSilicon")
+    newer = newer or switch
     return {"current": cur, "latest": latest, "available": bool(newer and pick), "asset": pick,
-            "location": location_problem(),
+            "location": location_problem(), "switch_to_native": switch,
             "notes": (data.get("body") or "").strip()[:2000], "published": data.get("published_at"),
             "installable": installed_app() is not None,
             "native": bool(pick and pick["arch"] == want)}
