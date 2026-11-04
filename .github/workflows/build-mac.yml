@@ -4,29 +4,54 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      only_arch:
+        description: "Build only this kind of Mac (AppleSilicon or Intel); empty = all"
+        default: ""
+      release_tag:
+        description: "Add the build to this existing release (e.g. v1.0.13) instead of making a new one"
+        default: ""
 
 permissions:
   contents: write
 
 jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+    steps:
+      - id: m
+        run: |
+          ALL='[{"runner":"macos-15","arch":"AppleSilicon"},{"runner":"macos-26","arch":"AppleSilicon"},{"runner":"macos-15-intel","arch":"Intel"}]'
+          ONLY="${{ inputs.only_arch }}"
+          if [ -n "$ONLY" ]; then
+            ALL=$(echo "$ALL" | jq -c --arg a "$ONLY" '[.[] | select(.arch == $a)]')
+          fi
+          echo "matrix={\"include\":$ALL}" >> "$GITHUB_OUTPUT"
+
   build:
-    # Two kinds of Mac build machine, so one busy pool doesn't block a release.
+    needs: plan
+    # Several kinds of Mac build machine, so one busy pool doesn't block a release.
+    # Apple Silicon has two pools (macos-15, macos-26); both are often full.
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - runner: macos-15
-            arch: AppleSilicon
-          - runner: macos-26        # a second Apple Silicon pool; the first was often full
-            arch: AppleSilicon
-          - runner: macos-15-intel
-            arch: Intel
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 2
+          ref: ${{ inputs.release_tag || github.sha }}
+
+      - name: Version
+        run: |
+          T="${{ inputs.release_tag }}"
+          if [ -n "$T" ]; then V="${T#v}"; else V="1.0.${GITHUB_RUN_NUMBER}"; T="v$V"; fi
+          echo "VERSION=$V" >> "$GITHUB_ENV"
+          echo "TAG=$T" >> "$GITHUB_ENV"
+          echo "Building $V for ${{ matrix.arch }}"
 
       - uses: actions/setup-python@v5
         with:
@@ -53,7 +78,6 @@ jobs:
             label_cropper.py
           APP="dist/Label Cropper.app"
           PLIST="$APP/Contents/Info.plist"
-          VERSION="1.0.${GITHUB_RUN_NUMBER}"
           plutil -replace CFBundleShortVersionString -string "$VERSION" "$PLIST"
           plutil -replace CFBundleVersion -string "$VERSION" "$PLIST"
           plutil -replace NSHighResolutionCapable -bool true "$PLIST"
@@ -89,7 +113,7 @@ jobs:
           cat "Label-Cropper-${{ matrix.arch }}.dmg.sha256"
 
       - name: Test a real in-app update
-        run: python label_cropper.py --update-selftest "Label-Cropper-${{ matrix.arch }}.dmg" "1.0.${GITHUB_RUN_NUMBER}"
+        run: python label_cropper.py --update-selftest "Label-Cropper-${{ matrix.arch }}.dmg" "$VERSION"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -104,9 +128,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          TAG="v1.0.${GITHUB_RUN_NUMBER}"
           FILE="Label-Cropper-${{ matrix.arch }}.dmg"
-          git log -1 --pretty='%s%n%n%b' | grep -v -E '^(Co-Authored-By|Claude-Session):' > notes.txt
+          git log -1 --pretty='%s%n%n%b' | grep -v -E '^(Co-Authored-By|Claude-Session):' > notes.txt || true
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' 2>/dev/null | grep -qx "$FILE"; then
             echo "$FILE was already published by the other Apple Silicon build"; exit 0
           fi

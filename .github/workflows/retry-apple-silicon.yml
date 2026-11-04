@@ -1,0 +1,32 @@
+name: Retry Apple Silicon build
+
+# GitHub's Apple Silicon build machines are often full and those builds get cancelled.
+# Every 3 hours, if the latest release has no Apple Silicon installer, build just that one
+# (same version, same code) and add it to the release. The app then offers "Switch now".
+on:
+  schedule:
+    - cron: "17 */3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  retry:
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          TAG=$(gh release view --repo "$REPO" --json tagName --jq .tagName)
+          if gh release view "$TAG" --repo "$REPO" --json assets --jq '.assets[].name' | grep -qx "Label-Cropper-AppleSilicon.dmg"; then
+            echo "$TAG already has an Apple Silicon installer. Nothing to do."; exit 0
+          fi
+          BUSY=$(gh run list --repo "$REPO" --workflow build-mac.yml --json status --jq '[.[] | select(.status=="queued" or .status=="in_progress" or .status=="waiting")] | length')
+          if [ "$BUSY" != "0" ]; then
+            echo "A build is already queued or running ($BUSY). Trying again next time."; exit 0
+          fi
+          echo "$TAG has no Apple Silicon installer yet. Starting that build."
+          gh workflow run build-mac.yml --repo "$REPO" -f only_arch=AppleSilicon -f release_tag="$TAG"
